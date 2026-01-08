@@ -1,14 +1,13 @@
 <?php
 /**
- * Copyright 2022-2025 FOSSBilling
- * Copyright 2011-2021 BoxBilling, Inc.
- * SPDX-License-Identifier: Apache-2.0.
- *
- * @copyright FOSSBilling (https://www.fossbilling.org)
- * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
+ * IPN HÍBRIDO - FOSSBilling + Mercado Pago
  * 
- * MODIFICADO: Suporte a Mercado Pago webhooks (JSON) + FIX headers array
+ * FUNCIONAMENTO:
+ * - Detecta automaticamente se é Mercado Pago (JSON) ou outro gateway (POST/GET)
+ * - Mercado Pago: busca gateway_id do banco, injeta JSON no $_POST
+ * - Outros: funciona normalmente com invoice_id e gateway_id na URL
  */
+
 require_once __DIR__ . DIRECTORY_SEPARATOR . 'load.php';
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Filesystem\Path;
@@ -17,12 +16,15 @@ $di = include Path::join(PATH_ROOT, 'di.php');
 $di['translate']();
 $filesystem = new Filesystem();
 
-// ====== CAPTURA DE HEADERS (necessário para validação MP) ======
+// ========================================
+// ETAPA 1: CAPTURA DE HEADERS
+// ========================================
+// Necessário porque Mercado Pago envia X-Signature, X-Request-Id
 $headers = [];
 if (function_exists('getallheaders')) {
     $headers = getallheaders();
 } else {
-    // Extração manual de headers do $_SERVER
+    // Fallback para servidores sem getallheaders()
     foreach ($_SERVER as $key => $value) {
         if (substr($key, 0, 5) === 'HTTP_') {
             $headerName = str_replace(' ', '-', ucwords(strtolower(str_replace('_', ' ', substr($key, 5)))));
@@ -30,84 +32,104 @@ if (function_exists('getallheaders')) {
         }
     }
 }
-
-// 🔥 CRÍTICO: Normaliza headers para lowercase ANTES de passar ao adapter
 $headers = array_change_key_case($headers, CASE_LOWER);
 
-// ====== DETECÇÃO DE WEBHOOK MERCADO PAGO ======
+// ========================================
+// ETAPA 2: LÊ O BODY RAW (JSON)
+// ========================================
 $rawInput = $filesystem->readFile('php://input');
+
+// ========================================
+// ETAPA 3: DETECTA MERCADO PAGO
+// ========================================
 $isMercadoPago = false;
-$mpData = null;
+$mpPaymentId = null;
 
 if (!empty($rawInput)) {
     $json = json_decode($rawInput, true);
     
-    // Detecta webhook do Mercado Pago pelo formato oficial
+    // Webhook do Mercado Pago tem esta estrutura:
+    // POST Body: {"type":"payment","action":"payment.created","data":{"id":"123456789"}}
+    // GET Query: ?id=123456789&topic=payment
+    
     if (json_last_error() === JSON_ERROR_NONE 
-        && isset($json['type']) 
-        && $json['type'] === 'payment'
-        && isset($json['data']['id'])) {
+        && isset($json['data']['id'])
+        && (isset($json['type']) || isset($json['action']))
+        && (($json['type'] ?? '') === 'payment' || strpos($json['action'] ?? '', 'payment') !== false)) {
         
         $isMercadoPago = true;
-        $mpData = $json;
+        $mpPaymentId = $json['data']['id'];
         
-        // Injeta os dados do JSON no $_POST para compatibilidade com adapters
+        // 🔥 INJETA NO $_POST para compatibilidade com FOSSBilling
         $_POST = array_merge($_POST, $json);
         $_REQUEST = array_merge($_REQUEST, $json);
-        
-        error_log('[IPN] Webhook Mercado Pago detectado - Payment ID: ' . $json['data']['id']);
     }
 }
 
-// ====== CAPTURA DE IDs (original FOSSBilling) ======
+// ========================================
+// ETAPA 4: CAPTURA IDs (método padrão)
+// ========================================
+// Para gateways normais: invoice_id e gateway_id vêm na URL
+// Exemplo: ipn.php?invoice_id=87&gateway_id=6
 $invoiceID = $_POST['invoice_id'] ?? $_GET['invoice_id'] ?? $_POST['bb_invoice_id'] ?? $_GET['bb_invoice_id'] ?? null;
 $gatewayID = $_POST['gateway_id'] ?? $_GET['gateway_id'] ?? $_POST['bb_gateway_id'] ?? $_GET['bb_gateway_id'] ?? null;
 
-// ====== MERCADO PAGO: Busca gateway_id do banco se não vier na request ======
+// ========================================
+// ETAPA 5: MERCADO PAGO - BUSCA GATEWAY_ID
+// ========================================
+// Como o MP não envia gateway_id, precisamos buscar no banco
 if ($isMercadoPago && empty($gatewayID)) {
     try {
-        // Busca o gateway Mercado Pago ativo (assume que existe apenas 1 ativo)
-        $gateway = $di['db']->findOne('pay_gateway', 'gateway = :gateway AND enabled = 1', [':gateway' => 'MercadoPago']);
+        $sql = 'SELECT id FROM pay_gateway WHERE gateway = :name AND enabled = 1 LIMIT 1';
+        $gateway = $di['db']->getRow($sql, [':name' => 'MercadoPago']);
         
-        if ($gateway) {
-            $gatewayID = $gateway->id;
-            error_log("[IPN] Gateway Mercado Pago ID obtido do banco: {$gatewayID}");
+        if ($gateway && isset($gateway['id'])) {
+            $gatewayID = (int)$gateway['id'];
         } else {
-            error_log('[IPN ERROR] Gateway Mercado Pago não encontrado ou desabilitado no banco!');
+            error_log('[IPN] ❌ Gateway MercadoPago não encontrado!');
+            error_log('[IPN] 💡 Verifique se está cadastrado e ATIVO em: Sistema > Pagamentos');
             http_response_code(500);
+            echo json_encode(['error' => 'Gateway MercadoPago not found or disabled']);
             exit;
         }
     } catch (Exception $e) {
-        error_log('[IPN ERROR] Erro ao buscar gateway: ' . $e->getMessage());
+        error_log('[IPN] ❌ Erro ao buscar gateway: ' . $e->getMessage());
         http_response_code(500);
+        echo json_encode(['error' => 'Database error']);
         exit;
     }
 }
 
-// Atualiza $_GET para compatibilidade com código legado
+// Atualiza $_GET para compatibilidade com FOSSBilling
 $_GET['bb_invoice_id'] = $invoiceID;
 $_GET['bb_gateway_id'] = $gatewayID;
 
-// Log dos headers capturados (debug)
+// ========================================
+// ETAPA 6: LOG DE DEBUG
+// ========================================
 if ($isMercadoPago) {
-    error_log('[IPN] Headers capturados (array): ' . json_encode(array_keys($headers)));
-    error_log('[IPN] Tipo de $headers: ' . gettype($headers) . ' com ' . count($headers) . ' itens');
-    
-    // Log específico dos headers que o MP usa
-    if (isset($headers['x-signature'])) {
-        error_log('[IPN] ✅ X-Signature encontrado: ' . substr($headers['x-signature'], 0, 50) . '...');
-    } else {
-        error_log('[IPN] ❌ X-Signature NÃO encontrado');
-    }
-    
-    if (isset($headers['x-request-id'])) {
-        error_log('[IPN] ✅ X-Request-Id encontrado: ' . $headers['x-request-id']);
-    } else {
-        error_log('[IPN] ❌ X-Request-Id NÃO encontrado');
-    }
+    error_log("[IPN] 📋 Invoice ID: " . ($invoiceID ?? 'SERÁ BUSCADO DO PAGAMENTO'));
+    error_log("[IPN] 🔧 Gateway ID: " . ($gatewayID ?? 'NULL'));
+    error_log("[IPN] 🔐 Headers:");
+    error_log("[IPN]    X-Signature: " . (isset($headers['x-signature']) ? '✓' : '✗'));
+    error_log("[IPN]    X-Request-Id: " . (isset($headers['x-request-id']) ? '✓' : '✗'));
 }
 
-// ====== MONTAGEM DO IPN ======
+// ========================================
+// ETAPA 7: VALIDA GATEWAY ID
+// ========================================
+if (empty($gatewayID)) {
+    error_log("[IPN] ❌ Gateway ID não fornecido!");
+    error_log("[IPN] POST: " . json_encode($_POST));
+    error_log("[IPN] GET: " . json_encode($_GET));
+    http_response_code(400);
+    echo json_encode(['error' => 'Gateway ID is required']);
+    exit;
+}
+
+// ========================================
+// ETAPA 8: MONTA O IPN
+// ========================================
 $ipn = [
     'skip_validation' => true,
     'invoice_id' => $invoiceID,
@@ -115,30 +137,30 @@ $ipn = [
     'get' => $_GET,
     'post' => $_POST,
     'server' => $_SERVER,
-    'headers' => $headers, // 🔥 AGORA É UM ARRAY NORMALIZADO
+    'headers' => $headers,
     'http_raw_post_data' => $rawInput,
 ];
 
-error_log('[IPN] Processando → Gateway: ' . ($gatewayID ?? 'NULL') . ' | Invoice: ' . ($invoiceID ?? 'NULL'));
-error_log('[IPN] 🔥 Headers sendo enviados ao adapter: ' . json_encode(array_keys($headers)));
-
-// ====== PROCESSAMENTO ======
+// ========================================
+// ETAPA 9: PROCESSA
+// ========================================
 try {
     $service = $di['mod_service']('invoice', 'transaction');
     $output = $service->createAndProcess($ipn);
     $res = ['result' => $output, 'error' => null];
     
     if ($isMercadoPago) {
-        error_log('[IPN] ✅ Webhook Mercado Pago processado com sucesso');
     }
 } catch (Exception $e) {
-    error_log('[IPN ERROR] ' . $e->getMessage());
-    error_log('[IPN TRACE] ' . $e->getTraceAsString());
+    error_log('[IPN] ❌ ERRO: ' . $e->getMessage());
+    error_log('[IPN] Stack: ' . $e->getTraceAsString());
     $res = ['result' => null, 'error' => ['message' => $e->getMessage()]];
     $output = false;
 }
 
-// ====== REDIRECIONAMENTO (retorno do cliente) ======
+// ========================================
+// ETAPA 10: REDIRECIONAMENTO (se solicitado)
+// ========================================
 if (isset($_GET['redirect'], $_GET['invoice_hash']) || isset($_GET['bb_redirect'], $_GET['bb_invoice_hash'])) {
     $hash = $_GET['invoice_hash'] ?? $_GET['bb_invoice_hash'];
     $url = $di['url']->link('invoice/' . $hash);
@@ -146,12 +168,10 @@ if (isset($_GET['redirect'], $_GET['invoice_hash']) || isset($_GET['bb_redirect'
     exit;
 }
 
-// ====== RESPOSTA ======
-// Mercado Pago espera resposta 200 rápida
-if ($isMercadoPago) {
-    http_response_code(200);
-}
-
+// ========================================
+// ETAPA 11: RESPOSTA
+// ========================================
+http_response_code($output ? 200 : 500);
 header('Cache-Control: no-cache, must-revalidate');
 header('Expires: Mon, 26 Jul 1997 05:00:00 GMT');
 header('Content-type: application/json; charset=utf-8');
