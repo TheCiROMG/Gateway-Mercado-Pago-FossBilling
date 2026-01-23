@@ -53,14 +53,6 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
                         'required' => false,
                     ],
                 ],
-                'logo_url' => [
-                    'text',
-                    [
-                        'label' => 'URL do Logo (Opcional)',
-                        'description' => 'URL da imagem para exibir no botão (ex: https://site.com/logo.png)',
-                        'required' => false,
-                    ],
-                ],
             ],
         ];
     }
@@ -77,12 +69,8 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
             $paymentUrl = $preference['init_point'];
 
-            $logoUrl = !empty($this->config['logo_url']) ? $this->config['logo_url'] : null;
-            
-            if (!$logoUrl) {
-                 // Use local asset by default
-                 $logoUrl = $this->di['tools']->url('data/assets/gateways/mercadopago.png');
-            }
+            // Use local asset by default
+            $logoUrl = $this->di['tools']->url('data/assets/gateways/mercadopago.png');
             
             $btnContent = "<img src='{$logoUrl}' alt='Mercado Pago' style='max-height:24px; vertical-align:middle; margin-right:10px;'> Pagar com Mercado Pago";
 
