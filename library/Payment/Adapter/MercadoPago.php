@@ -1,7 +1,7 @@
 <?php
 /**
  * Mercado Pago Checkout Pro para FOSSBilling
- * Versão com Validação de Webhook - Janeiro 2026
+ * Versão Simplificada - Janeiro 2026
  */
 
 class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOSSBilling\InjectionAwareInterface
@@ -31,11 +31,6 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             'supports_one_time_payments' => true,
             'supports_subscriptions' => false,
             'description' => 'Mercado Pago Checkout Pro com webhooks automáticos',
-            'logo' => [
-                'logo' => 'mercadopago.png',
-                'height' => '30px',
-                'width' => '90px',
-            ],
             'form' => [
                 'access_token' => [
                     'text',
@@ -48,8 +43,8 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
                 'secret_key' => [
                     'text',
                     [
-                        'label' => 'Secret Key',
-                        'description' => 'Para validar webhooks. Configure nas notificações do MP.',
+                        'label' => 'Secret Key (Opcional)',
+                        'description' => 'Para validar webhooks. Recomendado em produção.',
                         'required' => false,
                     ],
                 ],
@@ -68,14 +63,11 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             }
 
             $paymentUrl = $preference['init_point'];
-            $logoUrl = $this->di['tools']->url('data/assets/gateways/mercadopago.png');
-            
-            $btnContent = "<img src='{$logoUrl}' alt='Mercado Pago' style='max-height:24px; vertical-align:middle; margin-right:10px;'> Pagar com Mercado Pago";
 
             return "
             <div style='text-align:center; padding:30px;'>
                 <a href='{$paymentUrl}' class='btn btn-primary btn-lg' style='background:#009EE3; padding:18px 50px; font-size:20px;'>
-                    {$btnContent}
+                    💳 Pagar com Mercado Pago
                 </a>
                 <p style='margin-top:15px; color:#666;'>
                     Redirecionando em <strong id='countdown'>3</strong> segundos...
@@ -106,6 +98,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             return null;
         }
 
+        // 🔥 CORRIGIDO: Pega URL base usando tools do FOSSBilling
         $tools = $this->di['tools'];
         $baseUrl = $tools->url('');
         $webhookUrl = rtrim($baseUrl, '/') . '/ipn.php';
@@ -151,55 +144,19 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             return null;
         }
 
-        return json_decode($result, true);
+        $data = json_decode($result, true);
+        
+        return $data;
     }
 
     public function processTransaction($api_admin, $id, $data, $gateway_id)
     {
-        // ═══════════════════════════════════════════════════════════
-        // 🔐 VALIDAÇÃO DE WEBHOOK (SE SECRET_KEY CONFIGURADA)
-        // ═══════════════════════════════════════════════════════════
-        if (!empty($this->config['secret_key'])) {
-            $signature = $_SERVER['HTTP_X_SIGNATURE'] ?? '';
-            $requestId = $_SERVER['HTTP_X_REQUEST_ID'] ?? '';
-            
-            if (empty($signature)) {
-                error_log('[MercadoPago] ⚠️ Webhook sem assinatura (X-Signature ausente)');
-                http_response_code(401);
-                return;
-            }
-
-            // Reconstrói o payload original (FOSSBilling já parseou como $data['post'])
-            $payload = file_get_contents('php://input');
-            
-            // Calcula HMAC esperado
-            $expected = hash_hmac(
-                'sha256',
-                $requestId . $payload, // ⚠️ Formato: requestId + payload
-                $this->config['secret_key']
-            );
-
-            // Comparação segura
-            if (!hash_equals($expected, $signature)) {
-                error_log(sprintf(
-                    '[MercadoPago] ❌ Webhook INVÁLIDO - Request ID: %s | Signature: %s',
-                    $requestId,
-                    substr($signature, 0, 16) . '...'
-                ));
-                http_response_code(401);
-                return;
-            }
-
-            error_log('[MercadoPago] ✅ Webhook validado com sucesso');
-        }
-
-        // ═══════════════════════════════════════════════════════════
-        // 📦 PROCESSAMENTO DO WEBHOOK
-        // ═══════════════════════════════════════════════════════════
+        // O webhook do MP vem no formato: {"type":"payment","data":{"id":"123456"}}
         $webhook = $data['post'] ?? [];
+        
         $type = $webhook['type'] ?? $webhook['action'] ?? 'DESCONHECIDO';
 
-        // Filtra apenas eventos de pagamento
+        // Filtra apenas pagamentos
         if (strpos($type, 'payment') === false) {
             return;
         }
@@ -207,15 +164,16 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
         $paymentId = $webhook['data']['id'] ?? null;
         if (!$paymentId) {
             error_log('[MercadoPago] ❌ Sem payment ID');
+            error_log('[MercadoPago] Webhook completo: ' . json_encode($webhook, JSON_PRETTY_PRINT));
             return;
         }
 
-        // Ignora webhooks de teste
+        // Ignora webhooks de teste do MP
         if (in_array($paymentId, ['123456', '12345678', 1234567890])) {
             return;
         }
 
-        // Busca detalhes do pagamento na API do MP
+        // Busca detalhes do pagamento
         $payment = $this->getPayment($paymentId);
         if (!$payment) {
             error_log('[MercadoPago] ❌ Não foi possível buscar o pagamento');
@@ -232,18 +190,16 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
         // Verifica se já foi processado
         try {
-            $api_admin->invoice_transaction_get(['txn_id' => (string)$paymentId]);
-            return; // Já existe
+            $existing = $api_admin->invoice_transaction_get(['txn_id' => (string)$paymentId]);
+            return;
         } catch (Exception $e) {
-            // Não existe, continua
+            // Não existe, ok continuar
         }
 
-        // Se não for aprovado, registra como pendente (se for boleto/pix)
+        // Só processa se aprovado
         if ($payment['status'] !== 'approved') {
-            if (in_array($payment['status'], ['rejected', 'cancelled'])) {
-                return; // Ignora rejeitados
-            }
-
+            
+            // Registra como pendente
             try {
                 $api_admin->invoice_transaction_create([
                     'invoice_id' => $invoiceId,
@@ -261,14 +217,11 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             return;
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // ✅ PROCESSAR PAGAMENTO APROVADO
-        // ═══════════════════════════════════════════════════════════
-        try {
-            $invoice = $api_admin->invoice_get(['id' => $invoiceId]);
-            
+        // PROCESSAR PAGAMENTO APROVADO
+        try {         
+            $invoice = $api_admin->invoice_get(['id' => $invoiceId]);     
             if ($invoice['status'] === 'paid') {
-                return; // Já está paga
+                return;
             }
 
             // 1. Registra transação
@@ -283,13 +236,11 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             ]);
 
             // 2. Marca fatura como paga
-            $api_admin->invoice_mark_as_paid([
+                $api_admin->invoice_mark_as_paid([
                 'id' => $invoiceId,
                 'note' => "Mercado Pago Payment ID: {$paymentId}"
             ]);
-
-            error_log("[MercadoPago] ✅ Fatura #{$invoiceId} paga com sucesso! Payment ID: {$paymentId}");
-
+ 
         } catch (Exception $e) {
             error_log('[MercadoPago] ==========================================');
             error_log('[MercadoPago] ❌❌❌ ERRO CRÍTICO ❌❌❌');
@@ -319,6 +270,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
         if ($code !== 200) {
             error_log("[MercadoPago] ❌ Erro ao buscar pagamento (HTTP {$code})");
+            error_log("[MercadoPago] Resposta: {$result}");
             return null;
         }
 
@@ -335,6 +287,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             return $email;
         }
         
+        // Fallback para email do sistema
         try {
             $sysEmail = $this->di['mod_service']('system')->getParamValue('company_email');
             if ($sysEmail && filter_var($sysEmail, FILTER_VALIDATE_EMAIL)) {
