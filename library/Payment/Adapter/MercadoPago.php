@@ -31,6 +31,11 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             'supports_one_time_payments' => true,
             'supports_subscriptions' => false,
             'description' => 'Mercado Pago Checkout Pro com webhooks automáticos',
+            'logo' => [
+                'logo' => 'mercadopago.png',
+                'height' => '30px',
+                'width' => '90px',
+            ],
             'form' => [
                 'access_token' => [
                     'text',
@@ -64,10 +69,15 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
             $paymentUrl = $preference['init_point'];
 
+            // Use local asset by default
+            $logoUrl = $this->di['tools']->url('data/assets/gateways/mercadopago.png');
+            
+            $btnContent = "<img src='{$logoUrl}' alt='Mercado Pago' style='max-height:24px; vertical-align:middle; margin-right:10px;'> Pagar com Mercado Pago";
+
             return "
             <div style='text-align:center; padding:30px;'>
                 <a href='{$paymentUrl}' class='btn btn-primary btn-lg' style='background:#009EE3; padding:18px 50px; font-size:20px;'>
-                    💳 Pagar com Mercado Pago
+                    {$btnContent}
                 </a>
                 <p style='margin-top:15px; color:#666;'>
                     Redirecionando em <strong id='countdown'>3</strong> segundos...
@@ -199,7 +209,12 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
         // Só processa se aprovado
         if ($payment['status'] !== 'approved') {
             
-            // Registra como pendente
+            // Se for rejeitado ou cancelado, não cria transação pendente (evita poluição visual)
+            if (in_array($payment['status'], ['rejected', 'cancelled'])) {
+                return;
+            }
+
+            // Registra como pendente apenas se estiver em processamento ou pendente (ex: boleto/pix)
             try {
                 $api_admin->invoice_transaction_create([
                     'invoice_id' => $invoiceId,
