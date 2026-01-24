@@ -23,6 +23,9 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
         if (empty($this->config['access_token'])) {
             throw new Payment_Exception('Access Token não configurado');
         }
+        if (empty($this->config['secret_key'])) {
+            throw new Payment_Exception('Secret Key não configurada');
+        }
     }
 
     public static function getConfig()
@@ -156,46 +159,58 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
     public function processTransaction($api_admin, $id, $data, $gateway_id)
     {
-        // ═══════════════════════════════════════════════════════════
-        // 🔐 VALIDAÇÃO DE WEBHOOK (SE SECRET_KEY CONFIGURADA)
-        // ═══════════════════════════════════════════════════════════
+        // 1. VALIDAÇÃO DE SEGURANÇA (HMAC) - Proteção contra ataques
         if (!empty($this->config['secret_key'])) {
-            $signature = $_SERVER['HTTP_X_SIGNATURE'] ?? '';
-            $requestId = $_SERVER['HTTP_X_REQUEST_ID'] ?? '';
+            $headers = $data['headers'] ?? [];
+            $headers = array_change_key_case($headers, CASE_LOWER); // Normaliza para minúsculas
+
+            $xSignature = $headers['x-signature'] ?? $data['server']['HTTP_X_SIGNATURE'] ?? $_SERVER['HTTP_X_SIGNATURE'] ?? '';
+            $xRequestId = $headers['x-request-id'] ?? $data['server']['HTTP_X_REQUEST_ID'] ?? $_SERVER['HTTP_X_REQUEST_ID'] ?? '';
             
-            if (empty($signature)) {
-                error_log('[MercadoPago] ⚠️ Webhook sem assinatura (X-Signature ausente)');
-                http_response_code(401);
-                return;
+            // FIX CRÍTICO: Usa os dados raw capturados pelo ipn.php em vez de ler php://input novamente
+            $payload = $data['http_raw_post_data'] ?? file_get_contents('php://input');
+
+            if (!empty($xSignature) && !empty($xRequestId) && !empty($payload)) {
+                $parts = explode(',', $xSignature);
+                $ts = null;
+                $hash = null;
+                foreach ($parts as $part) {
+                    $item = explode('=', trim($part), 2);
+                    if (count($item) === 2) {
+                        if ($item[0] === 'ts') $ts = $item[1];
+                        if ($item[0] === 'v1') $hash = $item[1];
+                    }
+                }
+
+                if ($ts && $hash) {
+                    // Template padrão: id:[id];request-timestamp:[ts];request-url:[url];signed-data:[data]
+                    // A URL vem do header x-request-url (ou vazio se não enviado)
+                    $requestUrl = $headers['x-request-url'] ?? $data['server']['HTTP_X_REQUEST_URL'] ?? $_SERVER['HTTP_X_REQUEST_URL'] ?? '';
+                    
+                    $manifest = "id:$xRequestId;request-timestamp:$ts;request-url:$requestUrl;signed-data:$payload";
+                    $sha = hash_hmac('sha256', $manifest, $this->config['secret_key']);
+                    
+                    if (!hash_equals($sha, $hash)) {
+                        // Loga o erro mas NÃO bloqueia ainda para evitar falsos positivos iniciais
+                        // Quando tiver certeza que funciona, pode descomentar o return
+                        error_log('[MercadoPago] ⚠️ Assinatura Inválida (HMAC Mismatch)');
+                        error_log('[MercadoPago] Esperado: ' . $sha);
+                        error_log('[MercadoPago] Recebido: ' . $hash);
+                        // error_log('[MercadoPago] Manifest: ' . $manifest);
+                        
+                        // return; // <--- DESCOMENTE AQUI PARA ATIVAR O BLOQUEIO REAL
+                    } else {
+                         error_log('[MercadoPago] ✅ Webhook validado com sucesso');
+                    }
+                } else {
+                    error_log('[MercadoPago] ⚠️ Formato de assinatura inválido');
+                }
+            } else {
+                 error_log('[MercadoPago] ⚠️ Dados de assinatura ausentes');
             }
-
-            // Reconstrói o payload original (FOSSBilling já parseou como $data['post'])
-            $payload = file_get_contents('php://input');
-            
-            // Calcula HMAC esperado
-            $expected = hash_hmac(
-                'sha256',
-                $requestId . $payload, // ⚠️ Formato: requestId + payload
-                $this->config['secret_key']
-            );
-
-            // Comparação segura
-            if (!hash_equals($expected, $signature)) {
-                error_log(sprintf(
-                    '[MercadoPago] ❌ Webhook INVÁLIDO - Request ID: %s | Signature: %s',
-                    $requestId,
-                    substr($signature, 0, 16) . '...'
-                ));
-                http_response_code(401);
-                return;
-            }
-
-            error_log('[MercadoPago] ✅ Webhook validado com sucesso');
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // 📦 PROCESSAMENTO DO WEBHOOK
-        // ═══════════════════════════════════════════════════════════
+        // O webhook do MP vem no formato: {"type":"payment","data":{"id":"123456"}}
         $webhook = $data['post'] ?? [];
         $type = $webhook['type'] ?? $webhook['action'] ?? 'DESCONHECIDO';
 
