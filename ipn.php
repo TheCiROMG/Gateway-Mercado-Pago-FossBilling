@@ -40,17 +40,15 @@ $headers = array_change_key_case($headers, CASE_LOWER);
 $rawInput = $filesystem->readFile('php://input');
 
 // ========================================
-// ETAPA 3: DETECTA MERCADO PAGO
+// ETAPA 3: DETECTA MERCADO PAGO (AMBOS OS FORMATOS)
 // ========================================
 $isMercadoPago = false;
 $mpPaymentId = null;
 
+// FORMATO 1: POST com JSON Body
+// Exemplo: {"type":"payment","action":"payment.created","data":{"id":"123456789"}}
 if (!empty($rawInput)) {
     $json = json_decode($rawInput, true);
-    
-    // Webhook do Mercado Pago tem esta estrutura:
-    // POST Body: {"type":"payment","action":"payment.created","data":{"id":"123456789"}}
-    // GET Query: ?id=123456789&topic=payment
     
     if (json_last_error() === JSON_ERROR_NONE 
         && isset($json['data']['id'])
@@ -60,9 +58,34 @@ if (!empty($rawInput)) {
         $isMercadoPago = true;
         $mpPaymentId = $json['data']['id'];
         
-        // 🔥 INJETA NO $_POST para compatibilidade com FOSSBilling
+        // Injeta no $_POST para compatibilidade
         $_POST = array_merge($_POST, $json);
         $_REQUEST = array_merge($_REQUEST, $json);
+    }
+}
+
+// FORMATO 2: GET com Query Params
+// Exemplo: ?id=143368148296&topic=payment
+if (!$isMercadoPago && isset($_GET['id'], $_GET['topic'])) {
+    $topic = $_GET['topic'];
+    
+    // Aceita "payment" ou "merchant_order" (ambos são do MP)
+    if (in_array($topic, ['payment', 'merchant_order'], true)) {
+        $isMercadoPago = true;
+        $mpPaymentId = $_GET['id'];
+        
+        // Converte para formato JSON esperado pelo adapter
+        $simulatedJson = [
+            'type' => $topic,
+            'action' => $topic . '.updated',
+            'data' => ['id' => $mpPaymentId]
+        ];
+        
+        // Injeta no $_POST
+        $_POST = array_merge($_POST, $simulatedJson);
+        $_REQUEST = array_merge($_REQUEST, $simulatedJson);
+        
+        error_log("[IPN] 🔄 Convertido webhook GET para formato JSON");
     }
 }
 
