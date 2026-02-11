@@ -40,28 +40,45 @@ $headers = array_change_key_case($headers, CASE_LOWER);
 $rawInput = $filesystem->readFile('php://input');
 
 // ========================================
-// ETAPA 3: DETECTA MERCADO PAGO (AMBOS OS FORMATOS)
+// ETAPA 3: DETECTA MERCADO PAGO / ASTROPAY
 // ========================================
 $isMercadoPago = false;
+$isAstroPay = false;
+$isPayPal = false;
 $mpPaymentId = null;
 
 // FORMATO 1: POST com JSON Body
-// Exemplo: {"type":"payment","action":"payment.created","data":{"id":"123456789"}}
 if (!empty($rawInput)) {
     $json = json_decode($rawInput, true);
     
-    if (json_last_error() === JSON_ERROR_NONE 
-        && isset($json['data']['id'])
-        && (isset($json['type']) || isset($json['action']))
-        && (($json['type'] ?? '') === 'payment' || strpos($json['action'] ?? '', 'payment') !== false)) {
-        
-        $isMercadoPago = true;
-        $mpPaymentId = $json['data']['id'];
-        
-        // Injeta no $_POST para compatibilidade
-        $_POST = array_merge($_POST, $json);
-        $_REQUEST = array_merge($_REQUEST, $json);
+    if (json_last_error() === JSON_ERROR_NONE) {
+        // DETECÇÃO MERCADO PAGO
+        if (isset($json['data']['id'])
+            && (isset($json['type']) || isset($json['action']))
+            && (($json['type'] ?? '') === 'payment' || strpos($json['action'] ?? '', 'payment') !== false)) {
+            
+            $isMercadoPago = true;
+            $mpPaymentId = $json['data']['id'];
+            
+            // Injeta no $_POST para compatibilidade
+            $_POST = array_merge($_POST, $json);
+            $_REQUEST = array_merge($_REQUEST, $json);
+        }
+        // DETECÇÃO ASTROPAY
+        elseif (isset($json['payment_external_id']) && isset($json['merchant_payment_id'])) {
+            $isAstroPay = true;
+            // Injeta no $_POST para compatibilidade
+            $_POST = array_merge($_POST, $json);
+            $_REQUEST = array_merge($_REQUEST, $json);
+            error_log("[IPN] 🚀 Detectado webhook AstroPay");
+        }
     }
+}
+
+// FORMATO 1.5: POST de PayPal (detecção por campos específicos)
+if (!$isMercadoPago && !$isAstroPay && (isset($_POST['verify_sign']) || isset($_POST['txn_id'])) && isset($_POST['receiver_email'])) {
+    $isPayPal = true;
+    error_log("[IPN] 🚀 Detectado webhook PayPal");
 }
 
 // FORMATO 2: GET com Query Params
@@ -98,21 +115,35 @@ $invoiceID = $_POST['invoice_id'] ?? $_GET['invoice_id'] ?? $_POST['bb_invoice_i
 $gatewayID = $_POST['gateway_id'] ?? $_GET['gateway_id'] ?? $_POST['bb_gateway_id'] ?? $_GET['bb_gateway_id'] ?? null;
 
 // ========================================
-// ETAPA 5: MERCADO PAGO - BUSCA GATEWAY_ID
+// ETAPA 5: MERCADO PAGO / ASTROPAY / PAYPAL - BUSCA GATEWAY_ID
 // ========================================
-// Como o MP não envia gateway_id, precisamos buscar no banco
-if ($isMercadoPago && empty($gatewayID)) {
+// Como MP, AstroPay e PayPal (às vezes) não enviam gateway_id na URL, precisamos buscar no banco
+
+if (($isMercadoPago || $isAstroPay || $isPayPal) && empty($gatewayID)) {
+    $gatewayName = $isMercadoPago ? 'MercadoPago' : ($isAstroPay ? 'AstroPay' : 'PayPalEmail');
     try {
         $sql = 'SELECT id FROM pay_gateway WHERE gateway = :name AND enabled = 1 LIMIT 1';
-        $gateway = $di['db']->getRow($sql, [':name' => 'MercadoPago']);
+        $gateway = $di['db']->getRow($sql, [':name' => $gatewayName]);
         
         if ($gateway && isset($gateway['id'])) {
             $gatewayID = (int)$gateway['id'];
         } else {
-            error_log('[IPN] ❌ Gateway MercadoPago não encontrado!');
+            // Fallback para PayPal (tentar apenas 'PayPal' se 'PayPalEmail' falhar)
+            if ($isPayPal && $gatewayName === 'PayPalEmail') {
+                 $gateway = $di['db']->getRow('SELECT id FROM pay_gateway WHERE gateway = "PayPal" AND enabled = 1 LIMIT 1');
+                 if ($gateway && isset($gateway['id'])) {
+                     $gatewayID = (int)$gateway['id'];
+                 }
+            }
+        }
+
+        if ($gatewayID) {
+             // Encontrado
+        } else {
+            error_log("[IPN] ❌ Gateway $gatewayName não encontrado!");
             error_log('[IPN] 💡 Verifique se está cadastrado e ATIVO em: Sistema > Pagamentos');
             http_response_code(500);
-            echo json_encode(['error' => 'Gateway MercadoPago not found or disabled']);
+            echo json_encode(['error' => "Gateway $gatewayName not found or disabled"]);
             exit;
         }
     } catch (Exception $e) {
