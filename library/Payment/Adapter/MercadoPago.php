@@ -177,18 +177,18 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
         // Filtra apenas pagamentos
         if (strpos($type, 'payment') === false) {
             error_log('[MercadoPago] ⏭️ Ignorando webhook tipo: ' . $type);
-            return;
+            return true;
         }
 
         $paymentId = $webhook['data']['id'] ?? null;
         if (!$paymentId) {
             error_log('[MercadoPago] ❌ Sem payment ID no webhook');
-            return;
+            return false;
         }
 
         // Ignora webhooks de teste
         if (in_array($paymentId, ['123456', '12345678', 1234567890])) {
-            return;
+            return true;
         }
 
         error_log('[MercadoPago] 📨 Webhook recebido - Payment ID: ' . $paymentId);
@@ -197,7 +197,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
         $lockKey = "mp_payment_{$paymentId}";
         if ($this->isLocked($lockKey)) {
             error_log('[MercadoPago] 🔒 Pagamento já está sendo processado, ignorando duplicata');
-            return;
+            return true;
         }
         $this->setLock($lockKey);
 
@@ -205,8 +205,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             // Busca detalhes do pagamento
             $payment = $this->getPayment($paymentId);
             if (!$payment) {
-                error_log('[MercadoPago] ❌ Não foi possível buscar dados do pagamento');
-                return;
+                throw new Exception('Não foi possível buscar dados do pagamento (API Error)');
             }
 
             error_log('[MercadoPago] 💰 Status do pagamento: ' . $payment['status']);
@@ -214,7 +213,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             // Extrai invoice_id
             if (!preg_match('/^INV_(\d+)$/', $payment['external_reference'] ?? '', $m)) {
                 error_log('[MercadoPago] ❌ Referência inválida: ' . ($payment['external_reference'] ?? 'VAZIO'));
-                return;
+                return true; // Retorna true para não ficar tentando processar algo inválido
             }
 
             $invoiceId = (int)$m[1];
@@ -223,8 +222,10 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             // Verifica se já foi processado
             try {
                 $existing = $api_admin->invoice_transaction_get(['txn_id' => (string)$paymentId]);
-                error_log('[MercadoPago] ✅ Transação já processada anteriormente');
-                return;
+                if ($existing) {
+                    error_log('[MercadoPago] ✅ Transação já processada anteriormente');
+                    return true;
+                }
             } catch (Exception $e) {
                 // Não existe, continuar
             }
@@ -232,9 +233,9 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             // Só processa se aprovado
             if ($payment['status'] !== 'approved') {
                 // Se for rejeitado ou cancelado, não cria transação pendente (evita poluição visual)
-				if (in_array($payment['status'], ['rejected', 'cancelled'])) {
-					return;
-				}
+                if (in_array($payment['status'], ['rejected', 'cancelled'])) {
+                    return true;
+                }
 
                 // Registra como pendente
                 try {
@@ -252,7 +253,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
                     error_log('[MercadoPago] ⚠️ Erro ao registrar pendente: ' . $e->getMessage());
                 }
                 
-                return;
+                return true;
             }
 
             // ✅ PAGAMENTO APROVADO - PROCESSAR
@@ -262,7 +263,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             
             if ($invoice['status'] === 'paid') {
                 error_log('[MercadoPago] ℹ️ Fatura já está marcada como paga');
-                return;
+                return true;
             }
 
             // 1. Registra transação
@@ -288,6 +289,8 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             
             error_log('[MercadoPago] ✅✅✅ FATURA PAGA E SERVIÇO ATIVADO!');
             error_log('[MercadoPago] 📊 Resultado: ' . json_encode($result));
+            
+            return true;
 
         } catch (Exception $e) {
             error_log('[MercadoPago] ==========================================');
@@ -300,6 +303,7 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             error_log('[MercadoPago] Stack trace:');
             error_log($e->getTraceAsString());
             error_log('[MercadoPago] ==========================================');
+            throw $e; // Re-lança para o IPN retornar 500 e forçar retry do Mercado Pago
         } finally {
             $this->releaseLock($lockKey);
         }
@@ -350,7 +354,14 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
 
         $result = curl_exec($ch);
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $errno = curl_errno($ch);
+        $error = curl_error($ch);
         curl_close($ch);
+
+        if ($errno) {
+            error_log("[MercadoPago] ❌ Erro de conexão (cURL {$errno}): {$error}");
+            return null;
+        }
 
         if ($code !== 200) {
             error_log("[MercadoPago] ❌ Erro ao buscar pagamento (HTTP {$code})");
