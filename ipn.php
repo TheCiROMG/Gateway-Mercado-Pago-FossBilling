@@ -53,9 +53,15 @@ if (!empty($rawInput)) {
     
     if (json_last_error() === JSON_ERROR_NONE) {
         // DETECÇÃO MERCADO PAGO
-        if (isset($json['data']['id'])
-            && (isset($json['type']) || isset($json['action']))
-            && (($json['type'] ?? '') === 'payment' || strpos($json['action'] ?? '', 'payment') !== false)) {
+        if (isset($json['data']['id']) && (
+                (
+                    (isset($json['type']) || isset($json['action']))
+                    && in_array(($json['type'] ?? ''), ['payment', 'merchant_order', 'topic_merchant_order_wh'], true)
+                )
+                || (strpos($json['action'] ?? '', 'payment') !== false)
+                || (strpos($json['action'] ?? '', 'merchant_order') !== false)
+                || (strpos($json['action'] ?? '', 'topic_merchant_order_wh') !== false)
+            )) {
             
             $isMercadoPago = true;
             $mpPaymentId = $json['data']['id'];
@@ -103,6 +109,25 @@ if (!$isMercadoPago && isset($_GET['id'], $_GET['topic'])) {
         $_REQUEST = array_merge($_REQUEST, $simulatedJson);
         
         error_log("[IPN] 🔄 Convertido webhook GET para formato JSON");
+    }
+}
+
+// FORMATO 2.1: Webhook moderno com Query Params (data.id e type)
+// Exemplo: ?data.id=123456&type=payment
+if (!$isMercadoPago && isset($_GET['data.id'], $_GET['type'])) {
+    $type = $_GET['type'];
+    if (in_array($type, ['payment', 'merchant_order', 'topic_merchant_order_wh'], true)) {
+        $isMercadoPago = true;
+        $mpPaymentId = $_GET['data.id'];
+
+        $simulatedJson = [
+            'type' => $type,
+            'action' => $type . '.updated',
+            'data' => ['id' => $mpPaymentId]
+        ];
+
+        $_POST = array_merge($_POST, $simulatedJson);
+        $_REQUEST = array_merge($_REQUEST, $simulatedJson);
     }
 }
 

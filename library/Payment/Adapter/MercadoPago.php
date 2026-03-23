@@ -124,12 +124,13 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
         $tools = $this->di['tools'];
         $baseUrl = $tools->url('');
         $webhookUrl = rtrim($baseUrl, '/') . '/ipn.php';
+        $currencyId = $this->resolveCurrencyId($invoice);
 
         $payload = [
             'items' => [[
                 'title' => "Fatura #{$invoice['nr']}",
                 'quantity' => 1,
-                'currency_id' => 'BRL',
+                'currency_id' => $currencyId,
                 'unit_price' => $total,
             ]],
             'payer' => [
@@ -172,18 +173,76 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
     public function processTransaction($api_admin, $id, $data, $gateway_id)
     {
         $webhook = $data['post'] ?? [];
-        $type = $webhook['type'] ?? $webhook['action'] ?? 'DESCONHECIDO';
+        $dataId = $this->extractWebhookDataId($data);
 
-        // Filtra apenas pagamentos
-        if (strpos($type, 'payment') === false) {
-            error_log('[MercadoPago] ⏭️ Ignorando webhook tipo: ' . $type);
+        if (!$this->isValidWebhookSignature($data, $dataId)) {
+            error_log('[MercadoPago] ❌ Assinatura inválida (webhook ignorado)');
             return true;
         }
 
-        $paymentId = $webhook['data']['id'] ?? null;
-        if (!$paymentId) {
-            error_log('[MercadoPago] ❌ Sem payment ID no webhook');
+        $webhookType = $webhook['type'] ?? null;
+        $action = (string)($webhook['action'] ?? '');
+        $topic = $data['get']['topic'] ?? null;
+        $typeParam = $data['get']['type'] ?? null;
+
+        $isPayment = ($webhookType === 'payment') || (strpos($action, 'payment') !== false) || ($topic === 'payment') || ($typeParam === 'payment');
+        $isMerchantOrder = ($webhookType === 'merchant_order')
+            || ($webhookType === 'topic_merchant_order_wh')
+            || (strpos($action, 'merchant_order') !== false)
+            || (strpos($action, 'topic_merchant_order_wh') !== false)
+            || ($topic === 'merchant_order')
+            || ($topic === 'topic_merchant_order_wh')
+            || ($typeParam === 'merchant_order')
+            || ($typeParam === 'topic_merchant_order_wh');
+
+        if (!$isPayment && !$isMerchantOrder) {
+            $logType = $webhookType ?: ($typeParam ?: ($topic ?: ($action ?: 'DESCONHECIDO')));
+            error_log('[MercadoPago] ⏭️ Ignorando webhook tipo: ' . $logType);
+            return true;
+        }
+
+        if (!$dataId) {
+            error_log('[MercadoPago] ❌ Sem ID no webhook');
             return false;
+        }
+
+        $paymentId = null;
+        if ($isPayment) {
+            $paymentId = $dataId;
+        } else {
+            $merchantOrderId = $dataId;
+            $merchantOrder = $this->getMerchantOrder($merchantOrderId);
+            if (!$merchantOrder) {
+                throw new Exception('Não foi possível buscar dados da merchant order (API Error)');
+            }
+
+            $payments = $merchantOrder['payments'] ?? [];
+            if (!is_array($payments) || empty($payments)) {
+                error_log('[MercadoPago] ⏭️ Merchant order sem pagamentos: ' . $merchantOrderId);
+                return true;
+            }
+
+            foreach ($payments as $p) {
+                if (!is_array($p)) {
+                    continue;
+                }
+                if (($p['status'] ?? null) === 'approved' && !empty($p['id'])) {
+                    $paymentId = (string)$p['id'];
+                    break;
+                }
+            }
+
+            if ($paymentId === null) {
+                $first = $payments[0] ?? null;
+                if (is_array($first) && !empty($first['id'])) {
+                    $paymentId = (string)$first['id'];
+                }
+            }
+
+            if ($paymentId === null) {
+                error_log('[MercadoPago] ⏭️ Merchant order sem payment id utilizável: ' . $merchantOrderId);
+                return true;
+            }
         }
 
         // Ignora webhooks de teste
@@ -219,15 +278,22 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
             $invoiceId = (int)$m[1];
             error_log('[MercadoPago] 📋 Invoice ID extraído: ' . $invoiceId);
 
-            // Verifica se já foi processado
+            $existingTransactionId = null;
             try {
-                $existing = $api_admin->invoice_transaction_get(['txn_id' => (string)$paymentId]);
-                if ($existing) {
-                    error_log('[MercadoPago] ✅ Transação já processada anteriormente');
-                    return true;
+                $existingList = $api_admin->invoice_transaction_get_list([
+                    'txn_id' => (string)$paymentId,
+                    'per_page' => 1,
+                ]);
+                if (is_array($existingList)
+                    && isset($existingList['list'])
+                    && is_array($existingList['list'])
+                    && isset($existingList['list'][0])
+                    && is_array($existingList['list'][0])
+                    && !empty($existingList['list'][0]['id'])) {
+                    $existingTransactionId = (int)$existingList['list'][0]['id'];
+                    error_log('[MercadoPago] ✅ Transação já existe para este pagamento: #' . $existingTransactionId);
                 }
             } catch (Exception $e) {
-                // Não existe, continuar
             }
 
             // Só processa se aprovado
@@ -238,19 +304,21 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
                 }
 
                 // Registra como pendente
-                try {
-                    $api_admin->invoice_transaction_create([
-                        'invoice_id' => $invoiceId,
-                        'gateway_id' => $gateway_id,
-                        'txn_id' => (string)$paymentId,
-                        'amount' => $payment['transaction_amount'],
-                        'currency' => $payment['currency_id'],
-                        'status' => 'pending',
-                        'type' => 'payment',
-                    ]);
-                    error_log('[MercadoPago] 📝 Transação pendente registrada');
-                } catch (Exception $e) {
-                    error_log('[MercadoPago] ⚠️ Erro ao registrar pendente: ' . $e->getMessage());
+                if ($existingTransactionId === null) {
+                    try {
+                        $api_admin->invoice_transaction_create([
+                            'invoice_id' => $invoiceId,
+                            'gateway_id' => $gateway_id,
+                            'txn_id' => (string)$paymentId,
+                            'amount' => $payment['transaction_amount'],
+                            'currency' => $payment['currency_id'],
+                            'status' => 'pending',
+                            'type' => 'payment',
+                        ]);
+                        error_log('[MercadoPago] 📝 Transação pendente registrada');
+                    } catch (Exception $e) {
+                        error_log('[MercadoPago] ⚠️ Erro ao registrar pendente: ' . $e->getMessage());
+                    }
                 }
                 
                 return true;
@@ -266,18 +334,34 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
                 return true;
             }
 
-            // 1. Registra transação
-            error_log('[MercadoPago] 📝 Criando registro de transação...');
-            $txn = $api_admin->invoice_transaction_create([
-                'invoice_id' => $invoiceId,
-                'gateway_id' => $gateway_id,
-                'txn_id' => (string)$paymentId,
-                'amount' => $payment['transaction_amount'],
-                'currency' => $payment['currency_id'],
-                'status' => 'processed',
-                'type' => 'payment',
-            ]);
-            error_log('[MercadoPago] ✅ Transação criada: ID #' . $txn);
+            if (empty($invoice['gateway_id'])) {
+                error_log('[MercadoPago] ⚠️ Fatura sem gateway definido. Setando gateway antes de marcar como paga...');
+                $api_admin->invoice_update([
+                    'id' => $invoiceId,
+                    'gateway_id' => $gateway_id,
+                ]);
+                $invoice = $api_admin->invoice_get(['id' => $invoiceId]);
+            }
+
+            if (empty($invoice['gateway_id'])) {
+                throw new Exception('Fatura continua sem gateway definido após tentativa de update');
+            }
+
+            if ($existingTransactionId === null) {
+                error_log('[MercadoPago] 📝 Criando registro de transação...');
+                $txn = $api_admin->invoice_transaction_create([
+                    'invoice_id' => $invoiceId,
+                    'gateway_id' => $gateway_id,
+                    'txn_id' => (string)$paymentId,
+                    'amount' => $payment['transaction_amount'],
+                    'currency' => $payment['currency_id'],
+                    'status' => 'processed',
+                    'type' => 'payment',
+                ]);
+                error_log('[MercadoPago] ✅ Transação criada: ID #' . $txn);
+            } else {
+                error_log('[MercadoPago] ℹ️ Pulando criação de transação duplicada (já existe #' . $existingTransactionId . ')');
+            }
 
             // 2. Marca fatura como paga (ISSO ATIVA O SERVIÇO AUTOMATICAMENTE)
             error_log('[MercadoPago] 💵 Marcando fatura como paga...');
@@ -339,6 +423,122 @@ class Payment_Adapter_MercadoPago extends Payment_AdapterAbstract implements FOS
     {
         $lockFile = sys_get_temp_dir() . '/' . md5($key) . '.lock';
         @unlink($lockFile);
+    }
+
+    private function resolveCurrencyId(array $invoice): string
+    {
+        $currency = strtoupper((string)($invoice['currency'] ?? ''));
+        $supported = ['ARS', 'BRL', 'CLP', 'COP', 'MXN', 'PEN', 'UYU'];
+        if ($currency !== '' && in_array($currency, $supported, true)) {
+            return $currency;
+        }
+
+        if ($currency !== '') {
+            error_log('[MercadoPago] ⚠️ Moeda não suportada pelo Mercado Pago: ' . $currency . '. Usando BRL.');
+        }
+
+        return 'BRL';
+    }
+
+    private function extractWebhookDataId(array $data): ?string
+    {
+        $post = $data['post'] ?? [];
+        $id = $post['data']['id'] ?? null;
+        if ($id !== null && $id !== '') {
+            return (string)$id;
+        }
+
+        $get = $data['get'] ?? [];
+        if (isset($get['data.id']) && $get['data.id'] !== '') {
+            return (string)$get['data.id'];
+        }
+        if (isset($get['id']) && $get['id'] !== '') {
+            return (string)$get['id'];
+        }
+        if (isset($post['id']) && $post['id'] !== '') {
+            return (string)$post['id'];
+        }
+
+        return null;
+    }
+
+    private function isValidWebhookSignature(array $data, ?string $dataId): bool
+    {
+        $secret = trim((string)($this->config['secret_key'] ?? ''));
+        if ($secret === '') {
+            return true;
+        }
+
+        $headers = $data['headers'] ?? [];
+        if (!is_array($headers)) {
+            $headers = [];
+        }
+
+        $xSignature = $headers['x-signature'] ?? $headers['x_signature'] ?? null;
+        $xRequestId = $headers['x-request-id'] ?? $headers['x_request_id'] ?? null;
+
+        if (!$dataId) {
+            return true;
+        }
+
+        if (!$xSignature || !$xRequestId) {
+            error_log('[MercadoPago] ⚠️ Secret Key configurada, mas headers de assinatura não vieram no webhook');
+            return true;
+        }
+
+        $parts = explode(',', (string)$xSignature);
+        $ts = null;
+        $hash = null;
+        foreach ($parts as $part) {
+            $kv = explode('=', trim($part), 2);
+            if (count($kv) !== 2) {
+                continue;
+            }
+            if ($kv[0] === 'ts') {
+                $ts = $kv[1];
+            } elseif ($kv[0] === 'v1') {
+                $hash = $kv[1];
+            }
+        }
+
+        if (!$ts || !$hash) {
+            return false;
+        }
+
+        $manifest = "id:{$dataId};request-id:{$xRequestId};ts:{$ts};";
+        $expected = hash_hmac('sha256', $manifest, $secret);
+        return hash_equals(strtolower($expected), strtolower((string)$hash));
+    }
+
+    private function getMerchantOrder($merchantOrderId): ?array
+    {
+        $ch = curl_init("https://api.mercadopago.com/merchant_orders/{$merchantOrderId}");
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $this->config['access_token'],
+            ],
+            CURLOPT_TIMEOUT => 15,
+        ]);
+
+        $result = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $errno = curl_errno($ch);
+        $error = curl_error($ch);
+        curl_close($ch);
+
+        if ($errno) {
+            error_log("[MercadoPago] ❌ Erro de conexão (cURL {$errno}): {$error}");
+            return null;
+        }
+
+        if ($code !== 200) {
+            error_log("[MercadoPago] ❌ Erro ao buscar merchant order (HTTP {$code})");
+            error_log("[MercadoPago] Resposta: {$result}");
+            return null;
+        }
+
+        return json_decode($result, true);
     }
 
     private function getPayment($paymentId): ?array
